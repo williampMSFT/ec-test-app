@@ -10,17 +10,6 @@ unsafe extern "C" {
     fn EvaluateAcpi(input: *const i8, input_len: usize, buffer: *mut u8, buf_len: &mut usize) -> i32;
 }
 
-#[derive(num_enum::IntoPrimitive, num_enum::TryFromPrimitive, Debug, Copy, Clone)]
-#[repr(u16)]
-/// ACPI argument types - these correspond to the ACPI_METHOD_ARGUMENT_* defines in apiioct.h from the Windows SDK
-enum AcpiArgumentType {
-    Integer = 0x0,
-    String = 0x1,
-    Buffer = 0x2,
-    Package = 0x3,
-    PackageEx = 0x4,
-}
-
 const ERROR_SUCCESS: i32 = 0;
 
 mod guid {
@@ -34,88 +23,225 @@ mod guid {
     pub const FAN_CURRENT_RPM: uuid::Uuid = uuid::uuid!("adf95492-0776-4ffc-84f3-b6c8b5269683");
 }
 
-fn cstr_bytes_to_string(raw: &[u8]) -> Result<String> {
-    Ok(ffi::CStr::from_bytes_until_nul(raw)
-        .map_err(|_| color_eyre::eyre::eyre!("Invalid byte slice"))?
-        .to_str()
-        .map_err(|_| color_eyre::eyre::eyre!("String contains invalid characters"))?
-        .to_owned())
-}
+mod serialization {
+    use super::*;
 
-// A user-friendly ACPI input method containing a name and optional arguments
-struct AcpiMethodInput<'a, 'b> {
-    name: &'a str,
-    args: Option<&'b [AcpiMethodArgument]>,
-}
+    const ACPI_EVAL_INPUT_BUFFER_COMPLEX_SIGNATURE_EX: u32 = u32::from_le_bytes(*b"AeiF");
+    const ACPI_MAX_METHOD_NAME_LEN: usize = 256;
 
-/// A user-friendly ACPI method argument
-#[derive(Debug, Copy, Clone)]
-pub enum AcpiMethodArgument {
-    /// Arbitrary u32 integer (DWORD)
-    Int(u32),
-    /// Arbitrary string
-    Str(&'static str),
-    /// GUID in mixed-endian format
-    Guid(uuid::Bytes),
-}
+    impl From<num_enum::TryFromPrimitiveError<AcpiArgumentType>> for AcpiParseError {
+        fn from(_: num_enum::TryFromPrimitiveError<AcpiArgumentType>) -> Self {
+            AcpiParseError::InvalidFormat
+        }
+    }
 
-// Convert a user-friendly ACPI method argument to format expected by driver
-impl TryFrom<AcpiMethodArgument> for AcpiMethodArgumentV1 {
-    type Error = AcpiParseError;
-    fn try_from(arg: AcpiMethodArgument) -> Result<Self, AcpiParseError> {
-        Ok(match arg {
-            AcpiMethodArgument::Guid(g) => Self {
-                type_: 2,
-                data_length: 16,
-                data_32: 0,
-                data: g.to_vec(),
-            },
-            AcpiMethodArgument::Str(s) => {
-                let cstr = ffi::CString::new(s).map_err(|_| AcpiParseError::InvalidFormat)?;
-                Self {
-                    type_: 1,
-                    data_length: cstr.count_bytes() as u16 + 1,
-                    data_32: 0,
-                    data: cstr.as_bytes_with_nul().to_vec(),
+    #[derive(Debug)]
+    pub enum AcpiValue {
+        Integer(u32),
+        String(String),
+        Buffer(Vec<u8>),
+        Package(Box<Vec<AcpiValue>>),
+    }
+
+    impl AcpiValue {
+        pub fn from_guid(guid: uuid::Uuid) -> Self {
+            AcpiValue::Buffer(guid.to_bytes_le().to_vec())
+        }
+    }
+
+    #[derive(num_enum::IntoPrimitive, num_enum::TryFromPrimitive, Debug, Copy, Clone, Eq, PartialEq)]
+    #[repr(u16)]
+    /// ACPI argument types - these correspond to the ACPI_METHOD_ARGUMENT_* defines in apiioct.h from the Windows SDK
+    enum AcpiArgumentType {
+        Integer = 0x0,
+        String = 0x1,
+        Buffer = 0x2,
+        Package = 0x3,
+    }
+
+    impl AcpiValue {
+        fn serialize(&self) -> Vec<u8> {
+            match self {
+                AcpiValue::Integer(i) => {
+                    let header = AcpiMethodArgumentV1Header {
+                        type_: AcpiArgumentType::Integer.into(),
+                        data_length: core::mem::size_of::<u32>() as u16,
+                    };
+                    let mut buf = Vec::new();
+                    buf.extend(bytemuck::bytes_of(&header));
+                    buf.extend(&i.to_le_bytes());
+                    buf
+                }
+                AcpiValue::String(s) => {
+                    let cstr = ffi::CString::new(s.as_str()).expect("String contained null byte");
+                    let cstr_bytes = cstr.as_bytes_with_nul();
+                    let header = AcpiMethodArgumentV1Header {
+                        type_: AcpiArgumentType::String.into(),
+                        data_length: cstr_bytes.len() as u16,
+                    };
+                    let mut buf = Vec::new();
+                    buf.extend(bytemuck::bytes_of(&header));
+                    buf.extend(cstr_bytes);
+                    buf
+                }
+                AcpiValue::Buffer(b) => {
+                    let header = AcpiMethodArgumentV1Header {
+                        type_: AcpiArgumentType::Buffer.into(),
+                        data_length: b.len() as u16,
+                    };
+                    let mut buf = Vec::new();
+                    buf.extend(bytemuck::bytes_of(&header));
+                    buf.extend(b);
+                    buf
+                }
+                AcpiValue::Package(elements) => {
+                    let mut element_buffer = Vec::new();
+                    for element in elements.iter() {
+                        element_buffer.extend(element.serialize());
+                    }
+
+                    let header = AcpiMethodArgumentV1Header {
+                        type_: AcpiArgumentType::Package.into(),
+                        data_length: element_buffer.len() as u16,
+                    };
+
+                    let mut result = Vec::new();
+                    result.extend(bytemuck::bytes_of(&header));
+                    result.extend(element_buffer);
+                    result
                 }
             }
-            AcpiMethodArgument::Int(i) => Self {
-                type_: 0,
-                data_length: 4,
-                data_32: i,
-                data: i.to_le_bytes().to_vec(),
+        }
+
+        fn deserialize(data: &[u8]) -> Result<(Self, &[u8]), AcpiParseError> {
+            let (header, payload) = data.split_at(core::mem::size_of::<AcpiMethodArgumentV1Header>());
+            let header = bytemuck::try_from_bytes::<AcpiMethodArgumentV1Header>(header)
+                .map_err(|_| AcpiParseError::InvalidFormat)?;
+
+            if payload.len() < header.data_length as usize {
+                return Err(AcpiParseError::InsufficientLength);
+            }
+
+            match AcpiArgumentType::try_from(header.type_)? {
+                AcpiArgumentType::Integer => {
+                    if header.data_length as usize != core::mem::size_of::<u32>() {
+                        return Err(AcpiParseError::InvalidFormat);
+                    }
+                    let (payload, remaining) = payload.split_at(core::mem::size_of::<u32>());
+                    let int_bytes: [u8; 4] = payload[0..4].try_into().map_err(|_| AcpiParseError::InvalidFormat)?;
+                    Ok((AcpiValue::Integer(u32::from_le_bytes(int_bytes)), remaining))
+                }
+                AcpiArgumentType::String => {
+                    let (payload, remaining) = payload.split_at(header.data_length as usize);
+                    let string = cstr_bytes_to_string(payload).map_err(|_| AcpiParseError::InvalidFormat)?;
+                    Ok((AcpiValue::String(string), remaining))
+                }
+                AcpiArgumentType::Buffer => {
+                    let (payload, remaining) = payload.split_at(header.data_length as usize);
+                    let buffer = payload.to_vec();
+                    Ok((AcpiValue::Buffer(buffer), remaining))
+                }
+                AcpiArgumentType::Package => {
+                    let mut elements = Vec::new();
+                    let mut remaining = payload;
+                    while !remaining.is_empty() {
+                        let (element, rest) = AcpiValue::deserialize(remaining)?;
+                        elements.push(element);
+                        remaining = rest;
+                    }
+                    Ok((AcpiValue::Package(Box::new(elements)), remaining))
+                }
+            }
+        }
+    }
+
+    fn cstr_bytes_to_string(raw: &[u8]) -> Result<String> {
+        Ok(ffi::CStr::from_bytes_until_nul(raw)
+            .map_err(|_| color_eyre::eyre::eyre!("Invalid byte slice"))?
+            .to_str()
+            .map_err(|_| color_eyre::eyre::eyre!("String contains invalid characters"))?
+            .to_owned())
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+    struct AcpiMethodArgumentV1Header {
+        type_: u16,
+        data_length: u16, // Followed by either 4 bytes of data (for integers) or a variable-length buffer (for strings/buffers/packages)
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+    struct AcpiEvalOutputBufferV1Header {
+        _signature: u32,
+        length: u32,
+        count: u32, // Followed by `count` number of AcpiMethodArgumentV1Header + data
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+    struct AcpiEvalInputBufferComplexV1ExHeader {
+        signature: u32, // must be ACPI_EVAL_INPUT_BUFFER_COMPLEX_SIGNATURE_EX
+        method_name: [u8; ACPI_MAX_METHOD_NAME_LEN],
+        size: u32,
+        argument_count: u32,
+        // Followed by any number of AcpiMethodArgumentV1Header+data structs
+    }
+
+    pub fn serialize_acpi_request(name: &str, args: &[AcpiValue]) -> Result<Vec<u8>, AcpiParseError> {
+        // Maximum number of arguments allowed is 7 as per spec
+        if args.len() > 7 {
+            return Err(AcpiParseError::InsufficientLength);
+        }
+
+        if name.len() > ACPI_MAX_METHOD_NAME_LEN {
+            return Err(AcpiParseError::InsufficientLength);
+        }
+
+        let mut args_buffer = Vec::new();
+        for arg in args.iter() {
+            args_buffer.extend(arg.serialize());
+        }
+
+        let header = AcpiEvalInputBufferComplexV1ExHeader {
+            signature: ACPI_EVAL_INPUT_BUFFER_COMPLEX_SIGNATURE_EX,
+            method_name: {
+                let mut buffer = [0u8; ACPI_MAX_METHOD_NAME_LEN];
+                let bytes = name.as_bytes();
+                buffer[..bytes.len()].copy_from_slice(bytes);
+                buffer
             },
-        })
+            size: args_buffer.len() as u32,
+            argument_count: args.len() as u32,
+        };
+
+        let mut result = Vec::new();
+        result.extend(bytemuck::bytes_of(&header));
+        result.extend(args_buffer);
+        Ok(result)
+    }
+
+    pub fn deserialize_acpi_response(data: &[u8]) -> Result<Vec<AcpiValue>, AcpiParseError> {
+        let (header, payload) = data.split_at(core::mem::size_of::<AcpiEvalOutputBufferV1Header>());
+        let header = bytemuck::try_from_bytes::<AcpiEvalOutputBufferV1Header>(header)
+            .map_err(|_| AcpiParseError::InvalidFormat)?;
+
+        let mut result = Vec::new();
+        let payload = payload
+            .get(..header.length as usize)
+            .ok_or(AcpiParseError::InsufficientLength)?;
+        let mut remaining = payload;
+        for _ in 0..header.count {
+            let (value, rest) = AcpiValue::deserialize(remaining)?;
+            result.push(value);
+            remaining = rest;
+        }
+
+        Ok(result)
     }
 }
 
-#[repr(C)]
-#[derive(Debug)]
-pub struct AcpiEvalInputBufferComplexV1Ex {
-    pub signature: u32,
-    pub methodname: [u8; 256],
-    pub size: u32,
-    pub argumentcount: u32,
-    pub arguments: Vec<AcpiMethodArgumentV1>,
-}
-
-#[repr(C)]
-#[derive(Debug, Default)]
-pub struct AcpiEvalOutputBufferV1 {
-    pub signature: u32,
-    pub length: u32,
-    pub count: u32,
-    pub arguments: Vec<AcpiMethodArgumentV1>,
-}
-
-#[repr(C)]
-#[derive(Debug, Default)]
-pub struct AcpiMethodArgumentV1 {
-    pub type_: u16,
-    pub data_length: u16,
-    pub data_32: u32,
-    pub data: Vec<u8>,
-}
+use serialization::AcpiValue;
 
 #[derive(Debug)]
 pub enum AcpiParseError {
@@ -124,109 +250,10 @@ pub enum AcpiParseError {
     EvaluationFailed(i32),
 }
 
-pub const ACPI_EVAL_INPUT_BUFFER_COMPLEX_SIGNATURE_EX: u32 = u32::from_le_bytes(*b"AeiF");
-
 impl std::error::Error for AcpiParseError {}
 impl std::fmt::Display for AcpiParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
-    }
-}
-
-// Convert a user-friendly ACPI input method to format expected by driver
-impl TryFrom<AcpiMethodInput<'_, '_>> for AcpiEvalInputBufferComplexV1Ex {
-    type Error = AcpiParseError;
-    fn try_from(method: AcpiMethodInput) -> Result<Self, AcpiParseError> {
-        let mut buffer = [0u8; 256];
-        let bytes = method.name.as_bytes();
-        let len = bytes.len().min(256);
-        buffer[..len].copy_from_slice(&bytes[..len]);
-
-        let arguments = if let Some(args) = method.args {
-            args.iter()
-                .map(|&arg| AcpiMethodArgumentV1::try_from(arg))
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            Vec::default()
-        };
-        let size = arguments.iter().map(|arg| arg.data_length as u32).sum();
-
-        Ok(AcpiEvalInputBufferComplexV1Ex {
-            signature: ACPI_EVAL_INPUT_BUFFER_COMPLEX_SIGNATURE_EX,
-            methodname: buffer,
-            size,
-            argumentcount: arguments.len() as u32,
-            arguments,
-        })
-    }
-}
-
-// Convert ACPI input struct to a raw, packed byte buffer
-impl From<AcpiEvalInputBufferComplexV1Ex> for Vec<u8> {
-    fn from(input: AcpiEvalInputBufferComplexV1Ex) -> Self {
-        let mut buf = Vec::new();
-        buf.extend(&input.signature.to_le_bytes());
-        buf.extend(&input.methodname);
-        buf.extend(&input.size.to_le_bytes());
-        buf.extend(&input.argumentcount.to_le_bytes());
-
-        for arg in input.arguments.iter() {
-            buf.extend(&arg.type_.to_le_bytes());
-            buf.extend(&arg.data_length.to_le_bytes());
-            buf.extend(&arg.data);
-        }
-
-        buf
-    }
-}
-
-// Convert vec[u8] into AcpiEvalOutputBufferV1
-impl TryFrom<Vec<u8>> for AcpiEvalOutputBufferV1 {
-    type Error = AcpiParseError;
-    fn try_from(value: Vec<u8>) -> Result<Self, AcpiParseError> {
-        let signature = u32::from_le_bytes(value[0..4].try_into().map_err(|_| AcpiParseError::InvalidFormat)?);
-        let length = u32::from_le_bytes(value[4..8].try_into().map_err(|_| AcpiParseError::InvalidFormat)?);
-        let count = u32::from_le_bytes(value[8..12].try_into().map_err(|_| AcpiParseError::InvalidFormat)?);
-
-        let mut offset = 12;
-        let mut arguments = Vec::new();
-
-        for _ in 0..count {
-            if offset + 8 > value.len() {
-                return Err(AcpiParseError::InsufficientLength);
-            }
-
-            let type_ = u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
-            let data_length = u16::from_le_bytes(value[offset + 2..offset + 4].try_into().unwrap()) as usize;
-            let data_32 = if type_ == 0 {
-                u32::from_le_bytes(value[offset + 4..offset + 8].try_into().unwrap())
-            } else {
-                0
-            };
-            offset += 4;
-
-            if offset + data_length > value.len() {
-                return Err(AcpiParseError::InsufficientLength);
-            }
-
-            let data = value[offset..offset + data_length].to_vec();
-            offset += data_length;
-
-            arguments.push(AcpiMethodArgumentV1 {
-                type_,
-                data_length: data_length as u16,
-                data_32,
-                data,
-            });
-        }
-
-        // Now return generated content
-        Ok(AcpiEvalOutputBufferV1 {
-            signature,
-            length,
-            count,
-            arguments,
-        })
     }
 }
 
@@ -238,19 +265,9 @@ impl Acpi {
         Default::default()
     }
 
-    pub fn evaluate(name: &str, args: Option<&[AcpiMethodArgument]>) -> Result<AcpiEvalOutputBufferV1, AcpiParseError> {
-        // Maximum number of arguments allowed is 7 as per spec
-        if let Some(args) = args
-            && args.len() > 7
-        {
-            return Err(AcpiParseError::InsufficientLength);
-        }
-
-        let method = AcpiMethodInput { name, args };
-        let input = AcpiEvalInputBufferComplexV1Ex::try_from(method)?;
-
+    fn evaluate(name: &str, args: &[AcpiValue]) -> Result<Vec<AcpiValue>, AcpiParseError> {
         // Input buffer
-        let in_buf: Vec<u8> = input.into();
+        let in_buf: Vec<u8> = serialization::serialize_acpi_request(name, args)?;
         let in_buf_len = in_buf.len();
 
         // Output buffer
@@ -267,74 +284,65 @@ impl Acpi {
         };
 
         match res {
-            ERROR_SUCCESS => AcpiEvalOutputBufferV1::try_from(out_buf),
+            ERROR_SUCCESS => serialization::deserialize_acpi_response(&out_buf),
             err => Err(AcpiParseError::EvaluationFailed(err)),
         }
     }
 
     /// Evaluates the provided method with the provided arguments and returns its single u32 result.
     /// Errors if the result is not a single u32.
-    pub fn evaluate_u32(name: &str, args: Option<&[AcpiMethodArgument]>) -> Result<u32> {
+    fn evaluate_u32(name: &str, args: &[AcpiValue]) -> Result<u32> {
         let output = Acpi::evaluate(name, args)?;
 
-        if output.count != 1 {
+        if output.len() != 1 {
             Err(eyre!(
                 "{} returned unexpected number of arguments: {}",
                 name,
-                output.count
+                output.len()
             ))
-        } else if output.arguments[0].type_ != AcpiArgumentType::Integer as u16 {
-            Err(eyre!(
-                "{} returned argument of unexpected type: {}",
-                name,
-                output.arguments[0].type_
-            ))
+        } else if let AcpiValue::Integer(i) = output[0] {
+            Ok(i)
         } else {
-            Ok(output.arguments[0].data_32)
+            Err(eyre!("{} did not return an integer as expected", name))
         }
     }
 }
 
 fn acpi_get_var(guid: uuid::Uuid) -> Result<f64> {
-    let args = [AcpiMethodArgument::Int(1), AcpiMethodArgument::Guid(guid.to_bytes_le())];
-    let output = Acpi::evaluate("\\_SB.ECT0.TGVR", Some(&args))?;
+    let output = Acpi::evaluate("\\_SB.ECT0.TGVR", &[AcpiValue::Integer(1), AcpiValue::from_guid(guid)])?;
 
-    if output.count != 2 {
-        Err(eyre!("GET_VAR({guid}) unrecognized output"))
-    } else if output.arguments[0].data_32 != 0 {
-        Err(eyre!("GET_VAR({guid}) unknown failure"))
+    if let [AcpiValue::Integer(error_code), AcpiValue::Integer(value)] = output.as_slice() {
+        if *error_code == 0 {
+            Ok(f64::from(*value))
+        } else {
+            Err(eyre!("GET_VAR({guid}) returned error code {error_code}"))
+        }
     } else {
-        Ok(f64::from(output.arguments[1].data_32))
+        Err(eyre!("GET_VAR({guid}) unrecognized output - got {:?}", output))
     }
 }
 
 fn acpi_set_var(guid: uuid::Uuid, value: f64) -> Result<()> {
-    let value = value as u32;
+    let result_code = Acpi::evaluate_u32(
+        "\\_SB.ECT0.TSVR",
+        &[
+            AcpiValue::Integer(1),
+            AcpiValue::from_guid(guid),
+            AcpiValue::Integer(value as u32),
+        ],
+    )?;
 
-    let args = [
-        AcpiMethodArgument::Int(1),
-        AcpiMethodArgument::Guid(guid.to_bytes_le()),
-        AcpiMethodArgument::Int(value),
-    ];
-    let output = Acpi::evaluate("\\_SB.ECT0.TSVR", Some(&args))?;
-
-    if output.count != 1 {
-        Err(eyre!("SET_VAR({guid}, {value}) unrecognized output"))
-    } else if output.arguments[0].data_32 != 0 {
-        Err(eyre!("SET_VAR({guid}, {value}) unknown failure"))
-    } else {
+    if result_code == 0 {
         Ok(())
+    } else {
+        Err(eyre!("SET_VAR({guid}, {value}) returned error code {result_code}"))
     }
 }
 
 impl Source for Acpi {
     fn get_temperature(&self) -> Result<f64> {
-        let output = Acpi::evaluate("\\_SB.ECT0.RTMP", None)?;
-        if output.count != 1 {
-            Err(eyre!("GET_TMP unrecognized output"))
-        } else {
-            Ok(common::dk_to_c(output.arguments[0].data_32))
-        }
+        let output = Acpi::evaluate_u32("\\_SB.ECT0.RTMP", &[])?;
+        Ok(common::dk_to_c(output))
     }
 
     fn get_rpm(&self) -> Result<f64> {
@@ -362,106 +370,125 @@ impl Source for Acpi {
     }
 
     fn get_bst(&self) -> Result<crate::battery::BstData> {
-        let data = Acpi::evaluate("\\_SB.ECT0.TBST", None)?;
+        let data = Acpi::evaluate("\\_SB.ECT0.TBST", &[])?;
 
-        // We are expecting 4 32-bit values
-        if data.count != 4 {
-            Err(eyre!("GET_BST unrecognized output"))
-        } else {
+        if let [
+            AcpiValue::Integer(state),
+            AcpiValue::Integer(rate),
+            AcpiValue::Integer(capacity),
+            AcpiValue::Integer(voltage),
+        ] = data.as_slice()
+        {
             Ok(crate::battery::BstData {
-                state: crate::battery::ChargeState::try_from(data.arguments[0].data_32)?,
-                rate: data.arguments[1].data_32,
-                capacity: data.arguments[2].data_32,
-                voltage: data.arguments[3].data_32,
+                state: crate::battery::ChargeState::try_from(*state)?,
+                rate: *rate,
+                capacity: *capacity,
+                voltage: *voltage,
             })
+        } else {
+            Err(eyre!("GET_BST unrecognized output"))
         }
     }
 
     fn get_bix(&self) -> Result<crate::battery::BixData> {
-        let data = Acpi::evaluate("\\_SB.ECT0.TBIX", None)?;
-        // We are expecting 21 arguments
-        if data.count != 21 {
-            Err(eyre!("GET_BIX unrecognized output"))
-        } else {
+        // TODO this looks odd to me. Spec allows for only 7 input args. Not sure what the max outputs are, but 21 seems high and it looks
+        //      like the spec expects a package output with 21 elements, but this code is expecting 21 top-level arguments.
+        //      I wonder if a single package-return-value is auto unwrapped by the ACPI driver or something?
+        //      If it is, there may be some other issue with get_var...
+        let data = Acpi::evaluate("\\_SB.ECT0.TBIX", &[])?;
+        if let [
+            AcpiValue::Integer(revision),
+            AcpiValue::Integer(power_unit),
+            AcpiValue::Integer(design_capacity),
+            AcpiValue::Integer(last_full_capacity),
+            AcpiValue::Integer(battery_technology),
+            AcpiValue::Integer(design_voltage),
+            AcpiValue::Integer(warning_capacity),
+            AcpiValue::Integer(low_capacity),
+            AcpiValue::Integer(cycle_count),
+            AcpiValue::Integer(accuracy),
+            AcpiValue::Integer(max_sample_time),
+            AcpiValue::Integer(min_sample_time),
+            AcpiValue::Integer(max_average_interval),
+            AcpiValue::Integer(min_average_interval),
+            AcpiValue::Integer(capacity_gran1),
+            AcpiValue::Integer(capacity_gran2),
+            AcpiValue::String(model_number),
+            AcpiValue::String(serial_number),
+            AcpiValue::String(battery_type),
+            AcpiValue::String(oem_info),
+            AcpiValue::Integer(swap_cap),
+        ] = data.as_slice()
+        {
             Ok(crate::battery::BixData {
-                revision: data.arguments[0].data_32,
-                power_unit: crate::battery::PowerUnit::try_from(data.arguments[1].data_32)?,
-                design_capacity: data.arguments[2].data_32,
-                last_full_capacity: data.arguments[3].data_32,
-                battery_technology: crate::battery::BatteryTechnology::try_from(data.arguments[4].data_32)?,
-                design_voltage: data.arguments[5].data_32,
-                warning_capacity: data.arguments[6].data_32,
-                low_capacity: data.arguments[7].data_32,
-                cycle_count: data.arguments[8].data_32,
-                accuracy: data.arguments[9].data_32,
-                max_sample_time: data.arguments[10].data_32,
-                min_sample_time: data.arguments[11].data_32,
-                max_average_interval: data.arguments[12].data_32,
-                min_average_interval: data.arguments[13].data_32,
-                capacity_gran1: data.arguments[14].data_32,
-                capacity_gran2: data.arguments[15].data_32,
-                model_number: cstr_bytes_to_string(&data.arguments[16].data)?,
-                serial_number: cstr_bytes_to_string(&data.arguments[17].data)?,
-                battery_type: cstr_bytes_to_string(&data.arguments[18].data)?,
-                oem_info: cstr_bytes_to_string(&data.arguments[19].data)?,
-                swap_cap: crate::battery::SwapCap::try_from(data.arguments[20].data_32)?,
+                revision: *revision,
+                power_unit: crate::battery::PowerUnit::try_from(*power_unit)?,
+                design_capacity: *design_capacity,
+                last_full_capacity: *last_full_capacity,
+                battery_technology: crate::battery::BatteryTechnology::try_from(*battery_technology)?,
+                design_voltage: *design_voltage,
+                warning_capacity: *warning_capacity,
+                low_capacity: *low_capacity,
+                cycle_count: *cycle_count,
+                accuracy: *accuracy,
+                max_sample_time: *max_sample_time,
+                min_sample_time: *min_sample_time,
+                max_average_interval: *max_average_interval,
+                min_average_interval: *min_average_interval,
+                capacity_gran1: *capacity_gran1,
+                capacity_gran2: *capacity_gran2,
+                model_number: model_number.clone(),
+                serial_number: serial_number.clone(),
+                battery_type: battery_type.clone(),
+                oem_info: oem_info.clone(),
+                swap_cap: crate::battery::SwapCap::try_from(*swap_cap)?,
             })
+        } else {
+            Err(eyre!("GET_BIX unrecognized output - got {:?}", data))
         }
     }
 
     fn set_btp(&self, trippoint: u32) -> Result<()> {
         // No return value is expected according to ACPI spec
-        let _ = Acpi::evaluate("\\_SB.ECT0.TBTP", Some(&[AcpiMethodArgument::Int(trippoint)]))?;
+        let _ = Acpi::evaluate("\\_SB.ECT0.TBTP", &[AcpiValue::Integer(trippoint)])?;
         Ok(())
     }
 }
 
 impl RtcSource for Acpi {
     fn get_capabilities(&self) -> Result<TimeAlarmDeviceCapabilities> {
-        Ok(TimeAlarmDeviceCapabilities(Acpi::evaluate_u32(
-            "\\_SB.ECT0._GCP",
-            None,
-        )?))
+        Ok(TimeAlarmDeviceCapabilities(Acpi::evaluate_u32("\\_SB.ECT0._GCP", &[])?))
     }
 
     fn get_real_time(&self) -> Result<AcpiTimestamp> {
-        let result = Acpi::evaluate("\\_SB.ECT0._GRT", None)?;
-        if result.count != 1 {
-            return Err(eyre!("GET_REAL_TIME unrecognized output - got result {:?}", result));
-        }
+        let result = Acpi::evaluate("\\_SB.ECT0._GRT", &[])?;
 
-        let result = &result.arguments[0];
-        if result.type_ != AcpiArgumentType::Buffer as u16 {
-            return Err(eyre!("GET_REAL_TIME invalid output type {}", result.type_));
+        if let [AcpiValue::Buffer(buffer)] = result.as_slice() {
+            AcpiTimestamp::try_from_bytes(buffer)
+                .map_err(|e| eyre!("GET_REAL_TIME invalid output format: {:?} for bytes {:?}", e, buffer))
+        } else {
+            Err(eyre!("GET_REAL_TIME invalid output type {:?}", result))
         }
-
-        AcpiTimestamp::try_from_bytes(result.data.as_slice()).map_err(|e| {
-            eyre!(
-                "GET_REAL_TIME invalid output format: {:?} for bytes {:?}",
-                e,
-                result.data.as_slice()
-            )
-        })
     }
 
     fn get_wake_status(&self, timer_id: AcpiTimerId) -> Result<TimerStatus> {
         Ok(TimerStatus(Acpi::evaluate_u32(
             "\\_SB.ECT0._GWS",
-            Some(&[AcpiMethodArgument::Int(timer_id.into())]),
+            &[AcpiValue::Integer(timer_id.into())],
         )?))
     }
 
     fn get_expired_timer_wake_policy(&self, timer_id: AcpiTimerId) -> Result<AlarmExpiredWakePolicy> {
         Ok(AlarmExpiredWakePolicy(Acpi::evaluate_u32(
             "\\_SB.ECT0._TIP",
-            Some(&[AcpiMethodArgument::Int(timer_id.into())]),
+            &[AcpiValue::Integer(timer_id.into())],
         )?))
     }
 
     fn get_timer_value(&self, timer_id: AcpiTimerId) -> Result<AlarmTimerSeconds> {
         Ok(AlarmTimerSeconds(Acpi::evaluate_u32(
             "\\_SB.ECT0._TIV",
-            Some(&[AcpiMethodArgument::Int(timer_id.into())]),
+            &[AcpiValue::Integer(timer_id.into())],
         )?))
     }
 }
